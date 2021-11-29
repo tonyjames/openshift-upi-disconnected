@@ -1,0 +1,12 @@
+---
+all:
+  vars:
+    ansible_user: <change_me>
+    ansible_ssh_private_key_file: <change_me>
+  hosts:
+    <change_me>:
+      ansible_host: <change_me>
+  children:
+    bastion:
+      hosts:
+        <change_me>:

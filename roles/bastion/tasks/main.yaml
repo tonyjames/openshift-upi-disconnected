@@ -1,0 +1,184 @@
+---
+- name: Update all packges
+  dnf:
+    name: "*"
+    state: latest
+  register: updates
+
+- name: Install misc packages
+  dnf:
+    name: "{{packages}}"
+    state: present
+  vars:
+    packages:
+    - bash-completion
+    - httpd
+    - jq
+    - "@container-tools"
+
+- name: Enable httpd service
+  systemd:
+    name: httpd.service
+    state: started
+    enabled: yes
+
+- name: Reboot after update
+  reboot:
+  when: updates.changed
+
+- name: Download and install openshift-client
+  unarchive:
+    src: "{{ocp_client_url}}"
+    dest: /usr/local/bin
+    remote_src: yes
+    include: oc
+
+- name: Download and install openshift-install
+  unarchive:
+    src: "{{ocp_install_url}}"
+    dest: /usr/local/bin
+    remote_src: yes
+    include: openshift-install
+
+- name: Enable bash completion
+  copy:
+    src: files/openshift-completion.sh
+    dest: /etc/profile.d/openshift-completion.sh
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Create directories for container registry
+  file:
+    path: "{{item}}"
+    state: directory
+    mode: 0755
+  loop:
+    - /data/registry
+    - /data/registry-certs
+    - /data/registry-auth
+
+- name: Generate CA private key
+  openssl_privatekey:
+    path: /data/registry-certs/ca.key
+    size: 2048
+      
+- name: Generate CA CSR
+  openssl_csr:
+    path: /data/registry-certs/ca.csr
+    privatekey_path: /data/registry-certs/ca.key
+    common_name: "POC CA"
+    organization_name: "Red Hat"
+    basic_constraints: "CA:TRUE"
+    use_common_name_for_san: false
+
+- name: Generate CA certificate
+  openssl_certificate:
+    path: /data/registry-certs/ca.crt
+    privatekey_path: /data/registry-certs/ca.key
+    csr_path: /data/registry-certs/ca.csr
+    provider: selfsigned
+
+- name: Generate registry private key
+  openssl_privatekey:
+    path: /data/registry-certs/registry.key
+    size: 2048 
+
+- name: Generate registry CSR
+  openssl_csr:
+    path: /data/registry-certs/registry.csr
+    privatekey_path: /data/registry-certs/registry.key
+    common_name: "{{ansible_eth0.ipv4.address}}"
+    subject_alt_name: "IP:{{ansible_eth0.ipv4.address}}"
+
+- name: Generate registry certificate
+  openssl_certificate:
+    path: /data/registry-certs/registry.crt
+    privatekey_path: /data/registry-certs/registry.key
+    csr_path: /data/registry-certs/registry.csr
+    provider: ownca
+    ownca_path: /data/registry-certs/ca.crt
+    ownca_privatekey_path: /data/registry-certs/ca.key
+
+- name: Create htpasswd file for registry
+  shell: htpasswd -bBc /data/registry-auth/htpasswd {{registry_username}} {{registry_password}}
+
+- name: Start container registry
+  containers.podman.podman_container:
+    name: registry
+    image: docker.io/registry:2
+    state: started
+    ports:
+      - "5000:5000"
+    volume:
+      - /data/registry:/var/lib/registry:Z
+      - /data/registry-certs:/certs:Z
+      - /data/registry-auth:/auth:Z
+    env:
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/registry.crt
+      REGISTRY_HTTP_TLS_KEY: /certs/registry.key
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Registry Realm"
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    restart_policy: always
+  register: registry_container
+
+- name: Write pull-secret-rh.json
+  copy:
+    src: files/pull-secret.json
+    dest: /root/pull-secret-rh.json
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Write pull-secret-local.json
+  template:
+    src: templates/pull-secret-local.json.j2
+    dest: /root/pull-secret-local.json
+    owner: root
+    group: root
+    mode: 0644
+
+- name: Combine pull secrets
+  shell: jq -s '.[0] * .[1]' /root/pull-secret-rh.json /root/pull-secret-local.json > /root/pull-secret.json
+
+- name: Mirror OpenShift {{ocp_deploy_version}}
+  shell: |
+    /usr/local/bin/oc adm release mirror \
+      --registry-config=/root/pull-secret.json \
+      --from=quay.io/openshift-release-dev/ocp-release:{{ocp_deploy_version}} \
+      --to={{ansible_eth0.ipv4.address}}:5000/openshift-release-dev \
+      --to-release-image={{ansible_eth0.ipv4.address}}:5000/openshift-release-dev/ocp-release:{{ocp_deploy_version}} \
+      --insecure=true
+  when: registry_container.changed
+
+- name: Mirror OpenShift {{ocp_upgrade_version}}
+  shell: |
+    /usr/local/bin/oc adm release mirror \
+      --registry-config=/root/pull-secret.json \
+      --from=quay.io/openshift-release-dev/ocp-release:{{ocp_upgrade_version}} \
+      --to={{ansible_eth0.ipv4.address}}:5000/openshift-release-dev \
+      --to-release-image={{ansible_eth0.ipv4.address}}:5000/openshift-release-dev/ocp-release:{{ocp_upgrade_version}} \
+      --insecure=true
+  when: registry_container.changed
+
+- name: Fetch CA certificate
+  slurp:
+    src: /data/registry-certs/ca.crt
+  register: ca_certificate
+
+- name: Write install-config.yaml
+  template:
+    src: templates/install-config.yaml.j2
+    dest: /home/{{ansible_user}}/install-config.yaml
+    owner: "{{ansible_user}}"
+    group: "{{ansible_user}}"
+    mode: 0644
+
+- name: Write imagecontentsourcepolicy.yaml
+  template:
+    src: templates/imagecontentsourcepolicy.yaml.j2
+    dest: /home/{{ansible_user}}/imagecontentsourcepolicy.yaml
+    owner: "{{ansible_user}}"
+    group: "{{ansible_user}}"
+    mode: 0644

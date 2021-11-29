@@ -1,0 +1,12 @@
+---
+- ocp_cluster_name: <change_me>
+- domain: <change_me>
+- ocp_client_url: <change_me>
+- ocp_install_url: <change_me>
+- ocp_deploy_version: <change_me>
+- ocp_upgrade_version: <change_me>
+- registry_username: <change_me>
+- registry_password: <change_me>
+- registry_creds: "{{registry_username + ':' + registry_password}}"
+- registry_creds_encoded: "{{registry_creds |b64encode}}"
+- email_address: <change_me>
